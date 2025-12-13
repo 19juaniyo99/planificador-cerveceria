@@ -18,12 +18,8 @@ BANDAS = [
 ]
 
 DEMANDA_BASE = {
-    0: [3, 4, 3, 2, 3, 5], # Lunes
-    1: [3, 4, 3, 2, 3, 5],
-    2: [3, 4, 3, 2, 3, 5],
-    3: [3, 4, 3, 2, 3, 6],
-    4: [3, 5, 5, 3, 4, 8],
-    5: [3, 7, 7, 4, 4, 8],
+    0: [3, 4, 3, 2, 3, 5], 1: [3, 4, 3, 2, 3, 5], 2: [3, 4, 3, 2, 3, 5],
+    3: [3, 4, 3, 2, 3, 6], 4: [3, 5, 5, 3, 4, 8], 5: [3, 7, 7, 4, 4, 8],
     6: [3, 5, 5, 3, 3, 5]
 }
 
@@ -84,7 +80,6 @@ def generar(datos: InputPlanificador):
         for d in dias_str:
             for b in BANDAS:
                 bid = b["id"]
-                # Vacantes (permitimos hasta 10 por si hay caos, pero se penalizan)
                 vacs[(d, bid)] = model.NewIntVar(0, 10, f'v_{d}_{bid}')
                 for n in nombres:
                     shifts[(n, d, bid)] = model.NewBoolVar(f's_{n}_{d}_{bid}')
@@ -100,19 +95,15 @@ def generar(datos: InputPlanificador):
                 demanda = DEMANDA_BASE[dia_sem][bid]
                 es_sevilla = False
                 
-                # Ajuste por Eventos
                 for ev in evs_hoy:
                     if ev.tipo == "sevilla_home" and solapa(bid, ev.hora_kickoff, 2, 3):
-                        demanda = 11 # Aquí forzamos 11 exactos
+                        demanda = 11
                         es_sevilla = True
                     if ev.tipo == "champions" and ev.importancia_alta and solapa(bid, ev.hora_kickoff, 0, 2):
-                        demanda += 2 # Aquí sumamos +2 a la base exacta
+                        demanda += 2
                 
-                # REGLA DE ORO: Suma == Demanda (NO >=)
-                # Esto obliga a que sea el número exacto.
                 model.Add(sum(shifts[(n, d_str, bid)] for n in nombres) + vacs[(d_str, bid)] == demanda)
                 
-                # Regla Sevilla: Extras obligatorios presentes
                 if es_sevilla:
                     for n in nombres:
                         if mapa_emp[n].rol == "extra" and d_str not in mapa_emp[n].dias_no_disponible:
@@ -124,25 +115,40 @@ def generar(datos: InputPlanificador):
         for n in nombres:
             emp = mapa_emp[n]
             
-            # Disponibilidad
+            # 1. Días no disponibles (manuales)
             for bloq in emp.dias_no_disponible:
                 if bloq in dias_str:
                     for b in BANDAS: model.Add(shifts[(n, bloq, b["id"])] == 0)
             
-            # Betis (Aroa)
+            # 2. REGLA ESPECIAL EXTRAS (Lunes-Jueves y Viernes mañana)
+            if emp.rol == "extra":
+                for i, fecha in enumerate(fechas):
+                    d_extra = dias_str[i]
+                    dia_sem = fecha.weekday() # 0=Lun, 4=Vie, 5=Sab, 6=Dom
+                    
+                    if dia_sem <= 3: # Lunes(0) a Jueves(3) -> PROHIBIDO TOTAL
+                        for b in BANDAS:
+                            model.Add(shifts[(n, d_extra, b["id"])] == 0)
+                    
+                    elif dia_sem == 4: # Viernes(4) -> PROHIBIDO ANTES DE LAS 19:00
+                        for b in BANDAS:
+                            if b["start"] < 19: # Bandas 0, 1, 2, 3
+                                model.Add(shifts[(n, d_extra, b["id"])] == 0)
+
+            # 3. Betis (Aroa)
             if n.lower() == "aroa":
                 for ev in datos.eventos:
                     if ev.tipo == "betis_home" and ev.fecha in dias_str:
                         for b in BANDAS: model.Add(shifts[(n, ev.fecha, b["id"])] == 0)
 
-            # Continuidad (No huecos)
+            # 4. Continuidad
             for d in dias_str:
                 model.AddImplication(shifts[(n, d, 0)], shifts[(n, d, 1)])
                 model.AddBoolOr([shifts[(n, d, 1)], shifts[(n, d, 3)]]).OnlyEnforceIf(shifts[(n, d, 2)])
                 model.AddBoolOr([shifts[(n, d, 2)], shifts[(n, d, 4)]]).OnlyEnforceIf(shifts[(n, d, 3)])
                 model.AddBoolOr([shifts[(n, d, 3)], shifts[(n, d, 5)]]).OnlyEnforceIf(shifts[(n, d, 4)])
 
-            # Minimo 4h diarias (Si trabaja)
+            # 5. Minimo 4h diarias (si trabaja)
             for d in dias_str:
                 horas_dia = sum(shifts[(n, d, b["id"])] * b["duracion"] for b in BANDAS)
                 trabaja_hoy = model.NewBoolVar(f'tr_{n}_{d}')
@@ -150,7 +156,7 @@ def generar(datos: InputPlanificador):
                 model.Add(horas_dia == 0).OnlyEnforceIf(trabaja_hoy.Not())
                 model.Add(horas_dia >= 4).OnlyEnforceIf(trabaja_hoy)
 
-            # Semanales
+            # 6. Semanales
             for chunk in chunks:
                 if len(chunk) == 7:
                     horas_sem = sum(shifts[(n, d, b["id"])] * b["duracion"] for d in chunk for b in BANDAS)
@@ -164,12 +170,9 @@ def generar(datos: InputPlanificador):
         fijos = [n for n in nombres if mapa_emp[n].rol == "fijo"]
         for d in dias_str:
             for b in BANDAS:
-                # OJO: Si la demanda exacta es menor que 2 (ej: 1 persona), esto daría conflicto.
-                # Asumo que tus demandas siempre son >= 2.
                 model.Add(sum(shifts[(n, d, b["id"])] for n in fijos) >= 2)
 
         # --- D. OPTIMIZACIÓN ---
-        # Prioridad suprema: Evitar Vacantes (que significaría que no ha logrado cuadrar el número exacto)
         model.Minimize(sum(vacs.values()))
 
         # SOLVER
@@ -186,21 +189,17 @@ def generar(datos: InputPlanificador):
                     for b in BANDAS:
                         bid = b["id"]
                         quien = []
-                        # Fijos
                         for n in fijos:
                             if solver.Value(shifts[(n, d, bid)]): quien.append(n)
-                        # Extras
                         for n in nombres:
                             if mapa_emp[n].rol == "extra" and solver.Value(shifts[(n, d, bid)]): quien.append(n)
-                        # Vacantes
                         nv = solver.Value(vacs[(d, bid)])
                         for _ in range(nv): quien.append("VACANTE")
-                        
                         dia_obj["turnos"].append({"hora": b["nombre"], "personal": quien})
                     sem_data.append(dia_obj)
                 res["semanas"].append(sem_data)
             return res
-        return {"status": "IMPOSSIBLE", "msg": "No se puede cumplir la demanda EXACTA con las reglas actuales."}
+        return {"status": "IMPOSSIBLE", "msg": "No se puede cumplir la demanda con las restricciones de Extras."}
 
     except Exception as e:
         import traceback
