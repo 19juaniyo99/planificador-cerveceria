@@ -34,8 +34,9 @@ class EmpleadoInput(BaseModel):
     nombre: str
     rol: Literal["fijo", "extra"]
     max_horas_semana: int = 40
-    horas_acumuladas_mes: float = 0  # Viene de Google Sheets
-    ultimo_turno: Optional[str] = None # "M" o "T" (para rotación)
+    min_horas_semana: int = 16  # <--- ¡ESTA ES LA LÍNEA QUE FALTABA!
+    horas_acumuladas_mes: float = 0
+    ultimo_turno: Optional[str] = None
     dias_no_disponible: List[str] = []
 
 class EventoInput(BaseModel):
@@ -302,3 +303,4 @@ def generar(datos: PlanificadorInput):
     except Exception as e:
         import traceback
         return {"error": str(e), "trace": traceback.format_exc()}
+
