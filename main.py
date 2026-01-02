@@ -17,7 +17,7 @@ BANDAS = [
     {"id": 5, "nombre": "20-24", "duracion": 4, "start": 20, "end": 24, "es_apertura": False}, # Cierre
 ]
 
-# Demanda base (Mínimo personal necesario sin eventos)
+# Demanda base
 DEMANDA_BASE = {
     0: [3, 4, 3, 2, 3, 5], # Lunes
     1: [3, 4, 3, 2, 3, 5],
@@ -39,26 +39,22 @@ class EmpleadoInput(BaseModel):
 
 class EventoManualInput(BaseModel):
     nombre: str
-    fecha: str       # YYYY-MM-DD
-    hora_inicio: str # HH:MM
-    duracion: int    # Horas que dura el evento
-    personal_extra: int # Cuántos camareros extra se necesitan
+    fecha: str       
+    hora_inicio: str 
+    duracion: int    
+    personal_extra: int 
 
 class PlanificadorInput(BaseModel):
     fecha_inicio: str 
     empleados: List[EmpleadoInput]
-    eventos_manuales: List[EventoManualInput] = [] # Nueva lista
+    eventos_manuales: List[EventoManualInput] = [] 
 
 # --- 3. FUNCIONES AUXILIARES ---
 def solapa_evento(bid, hora_evento_str, duracion):
-    # Comprueba si la banda horaria choca con el evento
     h_inicio_ev = int(hora_evento_str.split(":")[0])
     h_fin_ev = h_inicio_ev + duracion
-    
     b_inicio = BANDAS[bid]["start"]
     b_fin = BANDAS[bid]["end"]
-    
-    # Lógica de solapamiento de intervalos
     return max(b_inicio, h_inicio_ev) < min(b_fin, h_fin_ev)
 
 def get_dias_semana(fecha_inicio_str):
@@ -92,39 +88,31 @@ def generar(datos: PlanificadorInput):
         for d_idx, d_str in enumerate(dias_str):
             for b in BANDAS:
                 bid = b["id"]
-                # Aumentamos el límite de vacantes por si hay un evento masivo
                 vacs[(d_idx, bid)] = model.NewIntVar(0, 15, f'v_{d_idx}_{bid}')
                 for n in nombres:
                     shifts[(n, d_idx, bid)] = model.NewBoolVar(f's_{n}_{d_idx}_{bid}')
 
-        # RESTRICCIONES DE DEMANDA (LÓGICA ACTUALIZADA)
+        # RESTRICCIONES DE DEMANDA
         for d_idx, fecha in enumerate(fechas):
             d_str = dias_str[d_idx]
             dia_sem = fecha.weekday()
-            
-            # Buscamos eventos manuales para este día
             eventos_hoy = [ev for ev in datos.eventos_manuales if ev.fecha == d_str]
             
             for b in BANDAS:
                 bid = b["id"]
-                # 1. Empezamos con la demanda base del bar
                 demanda_total = DEMANDA_BASE[dia_sem][bid]
-                
-                # 2. Sumamos personal extra si hay evento en esta hora
                 for ev in eventos_hoy:
                     if solapa_evento(bid, ev.hora_inicio, ev.duracion):
                         demanda_total += ev.personal_extra
 
-                # Restricción: Trabajadores + Vacantes >= Demanda Total
                 total_trabajando = sum(shifts[(n, d_idx, bid)] for n in nombres)
                 model.Add(total_trabajando + vacs[(d_idx, bid)] >= demanda_total)
                 
-                # Regla Apertura (Solo fijos)
                 if b["es_apertura"]:
                     fijos_apertura = [shifts[(n, d_idx, bid)] for n in nombres if mapa_emp[n].rol == "fijo"]
                     model.Add(sum(fijos_apertura) >= 2)
 
-        # RESTRICCIONES DE EMPLEADOS (Igual que v8)
+        # RESTRICCIONES DE EMPLEADOS
         for n in nombres:
             emp = mapa_emp[n]
             
@@ -133,35 +121,43 @@ def generar(datos: PlanificadorInput):
                 if parse_dias_descanso(emp.dias_descanso_input, d_idx):
                     for b in BANDAS: model.Add(shifts[(n, d_idx, b["id"])] == 0)
 
-            # Extras (Horario restringido)
+            # Extras
             if emp.rol == "extra":
                 for d_idx in range(7):
                     dia_sem = fechas[d_idx].weekday()
-                    if dia_sem <= 3: # L-J OFF
+                    if dia_sem <= 3: 
                         for b in BANDAS: model.Add(shifts[(n, d_idx, b["id"])] == 0)
-                    elif dia_sem == 4: # V Tarde
+                    elif dia_sem == 4: 
                         for b in BANDAS:
                             if b["start"] < 19: model.Add(shifts[(n, d_idx, b["id"])] == 0)
 
-            # Turnos y Bloques
+            # Lógica Diaria
             for d_idx in range(7):
                 trabaja_banda = [shifts[(n, d_idx, b["id"])] for b in BANDAS]
                 trabaja_hoy = model.NewBoolVar(f'tr_{n}_{d_idx}')
                 model.Add(sum(trabaja_banda) > 0).OnlyEnforceIf(trabaja_hoy)
                 model.Add(sum(trabaja_banda) == 0).OnlyEnforceIf(trabaja_hoy.Not())
 
+                # --- NUEVA REGLA: FLEXIBILIDAD DIARIA (7h - 10h) ---
+                horas_hoy = sum(shifts[(n, d_idx, b["id"])] * b["duracion"] for b in BANDAS)
+                
+                # Si trabaja hoy, debe hacer MÍNIMO 7 horas y MÁXIMO 10 (o lo que permita la ley)
+                if emp.rol == "fijo":
+                    model.Add(horas_hoy >= 7).OnlyEnforceIf(trabaja_hoy)
+                    model.Add(horas_hoy <= 11).OnlyEnforceIf(trabaja_hoy) # Dejamos margen hasta 11 por si acaso
+
+                # --- Roles Específicos ---
                 if emp.rol_especifico.lower() == "cierre":
                     model.Add(shifts[(n, d_idx, 5)] == 1).OnlyEnforceIf(trabaja_hoy)
                     emp.tipo_turno_input = "Corrido"
-
                 if emp.rol_especifico.lower() == "apertura":
                     model.Add(shifts[(n, d_idx, 0)] == 1).OnlyEnforceIf(trabaja_hoy)
                 
+                # --- Turno Corrido vs Partido ---
                 es_siempre_corrido = n.lower() in ["aroa", "marina"]
                 quiere_corrido = emp.tipo_turno_input.lower() == "corrido"
                 
                 if es_siempre_corrido or quiere_corrido:
-                    # Turno continuo
                     transiciones = model.NewIntVar(0, 2, f'trans_{n}_{d_idx}')
                     b_vars = [0] + trabaja_banda + [0]
                     lista_trans = []
@@ -171,16 +167,18 @@ def generar(datos: PlanificadorInput):
                         lista_trans.append(diff)
                     model.Add(sum(lista_trans) <= 2)
                 else: 
-                    # Turno partido
-                    model.AddImplication(shifts[(n, d_idx, 0)], shifts[(n, d_idx, 1)])
-                    model.AddBoolOr([shifts[(n, d_idx, 1)], shifts[(n, d_idx, 3)]]).OnlyEnforceIf(shifts[(n, d_idx, 2)])
-                    model.AddBoolOr([shifts[(n, d_idx, 3)], shifts[(n, d_idx, 5)]]).OnlyEnforceIf(shifts[(n, d_idx, 4)])
+                    # Partido (Simplificado para permitir flexibilidad)
+                    model.AddImplication(shifts[(n, d_idx, 0)], shifts[(n, d_idx, 1)]) # 12 lleva a 13
+                    # Descanso minimo 3h
                     model.AddImplication(shifts[(n, d_idx, 1)], shifts[(n, d_idx, 2)]).OnlyEnforceIf(shifts[(n, d_idx, 3)])
                     model.AddImplication(shifts[(n, d_idx, 2)], shifts[(n, d_idx, 3)]).OnlyEnforceIf(shifts[(n, d_idx, 4)])
 
-            # Horas Objetivo
+            # --- NUEVA REGLA: CONTROL SEMANAL FLEXIBLE ---
             horas_sem = sum(shifts[(n, d, b["id"])] * b["duracion"] for d in range(7) for b in BANDAS)
-            model.Add(horas_sem >= emp.horas_objetivo)
+            
+            # Margen de seguridad: Permitimos que falten hasta 5 horas o sobren 8.
+            # Esto absorbe los días de 7 horas.
+            model.Add(horas_sem >= emp.horas_objetivo - 5) 
             model.Add(horas_sem <= emp.horas_objetivo + 8)
 
         # OBJETIVO
